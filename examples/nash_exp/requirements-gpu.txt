@@ -1,0 +1,9 @@
+# For a fresh Python 3.10/vLLM 0.11.0 environment, use scripts/setup_server.sh.
+# Alternatively install these into an existing working veRL/vLLM GPU environment.
+# Keep its CUDA-compatible PyTorch/vLLM pair; record versions in environment.json.
+-r requirements-cpu.txt
+transformers>=4.51,<5
+datasets>=3,<5
+huggingface-hub>=0.30,<1
+accelerate>=1.5
+# vLLM and CUDA PyTorch must already be installed for the server's CUDA version.

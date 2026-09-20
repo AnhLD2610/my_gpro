@@ -1,0 +1,4 @@
+# Root veRL dependencies plus the Diagnostic B GPU requirements.
+# Paths are relative to this file, not the caller's working directory.
+-r ../../requirements.txt
+-r requirements-gpu.txt

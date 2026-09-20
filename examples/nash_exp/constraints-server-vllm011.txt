@@ -1,0 +1,20 @@
+# Apply from the first install: avoid installing then replacing large CUDA wheels.
+# vLLM 0.11.0 published dependencies: https://pypi.org/pypi/vllm/0.11.0/json
+vllm==0.11.0
+torch==2.8.0
+torchvision==0.23.0
+torchaudio==2.8.0
+xformers==0.0.32.post1
+transformers==4.57.6
+# Keep training/client APIs reproducible with this older vLLM release.
+tensordict==0.10.0
+peft==0.17.1
+openai==1.109.1
+# Carry experiment bounds into the first editable install to avoid replacements.
+datasets>=3,<5
+pandas>=2.1,<3
+huggingface-hub>=0.30,<1
+accelerate>=1.5
+# veRL requires NumPy <2. OpenCV 4.12+ requires NumPy >=2 on Python 3.10.
+numpy==1.26.4
+opencv-python-headless==4.11.0.86

@@ -39,8 +39,6 @@ def valid_config(tmp_path, monkeypatch):
     settings["routing"]["radius_coefficient"] = 0.2
     settings["seed"] = 42
     settings["verifier"]["backend"] = "math_verify"
-    settings["train"]["id"] = "synthetic/DAPO"
-    settings["train"]["revision"] = "a" * 40
     return settings
 
 
@@ -104,6 +102,61 @@ def test_valid_configuration_is_copied_and_round2_requires_explicit_gate(valid_c
 @pytest.mark.parametrize(
     ("field", "bad_value"),
     [
+        ("train.id", "synthetic/other-dataset"),
+        ("train.n_problem", 64),
+        ("heldout.n_problem", 32),
+        ("train.expected_rows", 500),
+        ("heldout.expected_rows", 7500),
+        ("train.split", "test"),
+        ("heldout.split", "train"),
+        ("heldout.selection", "sample"),
+        ("train.adapter", "dapo"),
+        ("heldout.revision", "main"),
+        ("heldout.revision", "a" * 40),
+    ],
+)
+def test_math_profile_rejects_wrong_pool_split_or_sampling(valid_config, field, bad_value):
+    section, key = field.split(".")
+    valid_config[section][key] = bad_value
+    with pytest.raises(config.ConfigurationError, match="MATH|immutable"):
+        config.validate_config(valid_config)
+
+
+def test_scaled_math_profile_samples_train_and_covers_complete_test_set(valid_config):
+    validated = config.validate_config(valid_config)
+    assert validated["train"]["n_problem"] == 500
+    assert validated["train"]["selection"] == "sample"
+    assert validated["train"]["expected_rows"] == 7500
+    assert validated["heldout"]["n_problem"] == validated["heldout"]["expected_rows"] == 500
+    assert validated["heldout"]["selection"] == "all"
+    assert validated["train"]["revision"] == validated["heldout"]["revision"]
+    assert validated["n_rollout"] * (validated["train"]["n_problem"] + validated["heldout"]["n_problem"]) == 32000
+
+
+def test_legacy_round1_configuration_remains_valid_for_cached_results(valid_config):
+    valid_config["model"].update(id="Qwen/Qwen3-1.7B-Base", max_model_len=32768)
+    valid_config["prompt"].pop("max_tokens", None)
+    valid_config["train"] = {
+        "id": "sungyub/dapo-math-17k-verl",
+        "revision": "3cf5c112137795c1f1d5fdae7c747871b26840a4",
+        "config": "default",
+        "split": "train",
+        "data_files": ["data/train-00000.parquet"],
+        "n_problem": 64,
+    }
+    valid_config["heldout"] = {
+        "id": "MathArena/hmmt_feb_2025",
+        "revision": "main",
+        "config": None,
+        "split": "train",
+        "n_problem": 30,
+    }
+    assert config.validate_config(valid_config) == valid_config
+
+
+@pytest.mark.parametrize(
+    ("field", "bad_value"),
+    [
         ("sampling.top_p", 0.9),
         ("sampling.top_k", 50),
         ("sampling.min_p", 0.1),
@@ -111,6 +164,37 @@ def test_valid_configuration_is_copied_and_round2_requires_explicit_gate(valid_c
         ("sampling.max_new_tokens", 32768),
         ("sampling.max_new_tokens", 2.5),
         ("sampling.max_new_tokens", True),
+        ("sampling.max_new_tokens", 0),
+        ("model.id", "Qwen/not-approved"),
+        ("model.max_model_len", None),
+        ("model.max_model_len", 0),
+        ("model.max_model_len", 4096.0),
+        ("model.max_model_len", True),
+        ("prompt.max_tokens", 0),
+        ("prompt.max_tokens", -1),
+        ("prompt.max_tokens", 1024.0),
+        ("prompt.max_tokens", True),
+        ("generation.tensor_parallel_size", 0),
+        ("generation.tensor_parallel_size", -1),
+        ("generation.tensor_parallel_size", True),
+        ("generation.tensor_parallel_size", 4.0),
+        ("generation.parallel_splits", 1),
+        ("generation.parallel_splits", "true"),
+        ("generation.parallel_splits", None),
+        ("generation.replicas_per_split", 0),
+        ("generation.replicas_per_split", -1),
+        ("generation.replicas_per_split", True),
+        ("generation.replicas_per_split", 4.0),
+        ("generation.dispatch_mode", "unsupported"),
+        ("generation.max_in_flight", 0),
+        ("generation.max_in_flight", True),
+        ("generation.max_num_seqs", -1),
+        ("generation.max_num_seqs", True),
+        ("generation.max_num_batched_tokens", 0),
+        ("generation.max_num_batched_tokens", 16384.0),
+        ("generation.request_chunk_size", 0),
+        ("generation.enable_chunked_prefill", "true"),
+        ("generation.enable_chunked_prefill", 1),
         ("routing.radius_coefficient", float("nan")),
         ("routing.radius_coefficient", float("inf")),
         ("routing.epsilon", float("nan")),
@@ -129,6 +213,80 @@ def test_scientific_config_rejects_invalid_values_at_author_gate(valid_config, f
     target[components[-1]] = bad_value
     with pytest.raises(config.ConfigurationError):
         config.validate_config(valid_config)
+
+
+def test_prompt_and_generation_budgets_must_fit_configured_context(valid_config):
+    valid_config["model"].update(id="Qwen/Qwen2.5-Math-7B", max_model_len=4096)
+    valid_config["prompt"]["max_tokens"] = 1024
+    valid_config["sampling"]["max_new_tokens"] = 3072
+    assert config.validate_config(valid_config) == valid_config
+    valid_config["prompt"]["max_tokens"] = 1025
+    with pytest.raises(config.ConfigurationError, match="prompt.max_tokens.*must fit"):
+        config.validate_config(valid_config)
+    valid_config["prompt"].pop("max_tokens")
+    valid_config["sampling"]["max_new_tokens"] = 4096
+    with pytest.raises(config.ConfigurationError, match="leave room for the prompt"):
+        config.validate_config(valid_config)
+
+
+def test_prompt_limit_environment_override(valid_config, monkeypatch, tmp_path):
+    import yaml
+
+    path = tmp_path / "config.yaml"
+    path.write_text(yaml.safe_dump(valid_config))
+    monkeypatch.setenv("NASH_MAX_PROMPT_TOKENS", "1000")
+    loaded = config.load_config(path)
+    assert loaded["prompt"]["max_tokens"] == 1000
+
+
+@pytest.mark.parametrize(
+    "value,expected", [("1", True), ("0", False), ("true", True), ("false", False), ("TRUE", True)]
+)
+def test_parallel_split_environment_override_uses_explicit_boolean(monkeypatch, value, expected):
+    monkeypatch.setenv("NASH_PARALLEL_SPLITS", value)
+    loaded = config.load_config(EXP_ROOT / "configs" / "diagnostic_b_round1.yaml")
+    assert loaded["generation"]["parallel_splits"] is expected
+
+
+@pytest.mark.parametrize("value", ["yes", "2", "enabled"])
+def test_parallel_split_environment_override_rejects_ambiguous_values(monkeypatch, value):
+    monkeypatch.setenv("NASH_PARALLEL_SPLITS", value)
+    with pytest.raises(config.ConfigurationError, match="NASH_PARALLEL_SPLITS"):
+        config.load_config(EXP_ROOT / "configs" / "diagnostic_b_round1.yaml")
+
+
+def test_parallel_split_setting_is_optional_for_legacy_configs(valid_config):
+    valid_config["generation"].pop("parallel_splits", None)
+    valid_config["generation"].pop("replicas_per_split", None)
+    assert config.validate_config(valid_config) == valid_config
+
+
+def test_multiple_replicas_require_parallel_execution_before_loading_models(valid_config, monkeypatch):
+    imported = _deny_external_imports(monkeypatch)
+    valid_config["generation"].update(parallel_splits=False, replicas_per_split=4)
+    with pytest.raises(config.ConfigurationError, match="replicas_per_split must be 1 when parallel_splits is false"):
+        config.validate_config(valid_config)
+    valid_config["generation"]["replicas_per_split"] = 1
+    assert config.validate_config(valid_config) == valid_config
+    assert imported == []
+
+
+@pytest.mark.parametrize(
+    "variable,field,text,expected",
+    [
+        ("NASH_REPLICAS_PER_SPLIT", "replicas_per_split", "2", 2),
+        ("NASH_GENERATION_MODE", "dispatch_mode", "batch", "batch"),
+        ("NASH_MAX_IN_FLIGHT", "max_in_flight", "512", 512),
+        ("NASH_MAX_NUM_SEQS", "max_num_seqs", "128", 128),
+        ("NASH_MAX_BATCHED_TOKENS", "max_num_batched_tokens", "8192", 8192),
+    ],
+)
+def test_generation_execution_environment_overrides(valid_config, monkeypatch, variable, field, text, expected):
+    monkeypatch.setenv(variable, text)
+    loaded = config.load_config(EXP_ROOT / "configs" / "diagnostic_b_round1.yaml")
+    assert loaded["generation"][field] == expected
+    assert type(loaded["generation"][field]) is type(expected)
+    assert config.validate_config(loaded) == loaded
 
 
 def test_immutable_dataset_revision_is_checked_before_optional_imports(monkeypatch):
@@ -293,6 +451,49 @@ def test_final_box_extraction_preserves_nested_latex_and_escaped_braces():
     expected = r"\boxed{\left\{\frac{1}{2}, 3\right\}}"
     assert data.last_boxed_answer(r"Earlier \boxed{0}, then " + expected + " trailing text") == expected
     assert data.last_boxed_answer(r"Answer: \boxed   {\frac{1}{2}}") == r"\boxed{\frac{1}{2}}"
+
+
+@pytest.mark.parametrize("command", ["color", "textcolor"])
+@pytest.mark.parametrize("content", ["5", r"\frac{1}{2}", r"\left\{\frac{1}{2}, 3\right\}"])
+def test_boxed_color_is_styling_for_prediction_and_reference(command, content):
+    styled = "\\" + command + "{blue}{" + content + "}"
+    response = r"\boxed{" + styled + "}"
+    plain = r"\boxed{" + content + "}"
+    assert data.normalize_boxed_color(response) == plain
+    verifier = data.MathVerifier({"backend": "math_verify", "answer_format": "boxed", "timeout_seconds": 5})
+    assert verifier.score(response, content) == {"reward": 1, "parse_status": "parsed", "reason": "correct"}
+    assert verifier.score(plain, styled) == {"reward": 1, "parse_status": "parsed", "reason": "correct"}
+
+
+def test_color_normalization_preserves_content_whitespace_exactly():
+    content = "\n " + r"\frac{1}{2}" + " \n"
+    boxed = r"\boxed{  \textcolor{RoyalBlue}{" + content + "}  }"
+    assert data.normalize_boxed_color(boxed) == r"\boxed{" + content + "}"
+
+
+@pytest.mark.parametrize(
+    "boxed",
+    [
+        r"\boxed{\color{blue}{5}+1}",
+        r"\boxed{\textcolor{blue}{5} trailing}",
+        r"\boxed{1+\color{blue}{5}}",
+        r"\boxed{\color{}{5}}",
+        r"\boxed{\color{blue!50!red}{5}}",
+        r"\boxed{\color{blue}5}",
+        r"\boxed{\color{blue}{\frac{1}{2}}",
+        r"\boxed{28.2.}",
+    ],
+)
+def test_color_normalization_does_not_repair_or_drop_other_answer_content(boxed):
+    assert data.normalize_boxed_color(boxed) == boxed
+
+
+def test_color_normalization_never_selects_an_earlier_box_or_hides_invalid_final_box():
+    verifier = data.MathVerifier({"backend": "math_verify", "answer_format": "boxed", "timeout_seconds": 5})
+    earlier = r"First \boxed{\color{blue}{5}}; final "
+    assert verifier.score(earlier + r"\boxed{7}", "5")["reward"] == 0
+    assert verifier.score(earlier + r"\boxed{\color{blue}{5}", "5")["parse_status"] == "prediction_parse_failure"
+    assert verifier.score(r"\boxed{\color{blue}{5}+1}", "5")["reward"] == 0
 
 
 def test_resume_after_postgeneration_failure_preserves_one_rollout_cache(tmp_path):

@@ -16,6 +16,11 @@ from pathlib import Path
 import yaml
 
 ROOT = Path(__file__).resolve().parents[1]
+MATH_DATASET_ID = "ShuoZheLi/MATH-train-MATH500-test"
+SUPPORTED_MODELS = {
+    "Qwen/Qwen3-1.7B-Base": "qwen3",
+    "Qwen/Qwen2.5-Math-7B": "qwen2",
+}
 FEATURE_GEOMETRIES = {
     "delta_proxy": "delta_selected_token_gradient_proxy",
     "exact_tiled_head": "unprojected_output_path_lm_head_proxy",
@@ -34,8 +39,22 @@ def feature_geometry(config):
     return FEATURE_GEOMETRIES.get(backend, backend)
 
 
+class ConfigurationError(ValueError):
+    """Required scientific choices or execution prerequisites are unresolved."""
+
+
+def _parallel_splits_env(value):
+    normalized = value.strip().lower()
+    if normalized in ("1", "true"):
+        return True
+    if normalized in ("0", "false"):
+        return False
+    raise ConfigurationError("NASH_PARALLEL_SPLITS must be true, false, 1, or 0")
+
+
 ENV_OVERRIDES = {
     "NASH_MAX_NEW_TOKENS": ("sampling.max_new_tokens", int),
+    "NASH_MAX_PROMPT_TOKENS": ("prompt.max_tokens", int),
     "NASH_RADIUS_C": ("routing.radius_coefficient", float),
     "NASH_SEED": ("seed", int),
     "NASH_DAPO_ID": ("train.id", str),
@@ -44,17 +63,20 @@ ENV_OVERRIDES = {
     "NASH_PROMPT_WRAPPER": ("prompt.wrapper_file", str),
     "NASH_VERIFIER": ("verifier.backend", str),
     "NASH_FEATURE_BACKEND": ("features.backend", str),
+    "NASH_FACTOR_CACHE_RETENTION": ("features.factor_cache_retention", str),
     "NASH_MODEL_REVISION": ("model.revision", str),
     "NASH_MODEL_PATH": ("model.local_path", str),
     "NASH_TENSOR_PARALLEL_SIZE": ("generation.tensor_parallel_size", int),
+    "NASH_PARALLEL_SPLITS": ("generation.parallel_splits", _parallel_splits_env),
+    "NASH_REPLICAS_PER_SPLIT": ("generation.replicas_per_split", int),
+    "NASH_GENERATION_MODE": ("generation.dispatch_mode", str),
+    "NASH_MAX_IN_FLIGHT": ("generation.max_in_flight", int),
+    "NASH_MAX_NUM_SEQS": ("generation.max_num_seqs", int),
+    "NASH_MAX_BATCHED_TOKENS": ("generation.max_num_batched_tokens", int),
     "NASH_GPU_MEMORY_GIB": ("memory.gpu_budget_gib", float),
     "NASH_CPU_MEMORY_GIB": ("memory.cpu_budget_gib", float),
     "NASH_DISK_BUDGET_GIB": ("memory.disk_budget_gib", float),
 }
-
-
-class ConfigurationError(ValueError):
-    """Required scientific choices or execution prerequisites are unresolved."""
 
 
 def dotted(config, name):
@@ -117,14 +139,60 @@ def validate_config(config, *, enable_round2=False):
         errors.append("train.revision must be an immutable 40-character commit SHA, or supply train.local_path")
     if config.get("seed") is not None and (type(config["seed"]) is not int or config["seed"] < 0):
         errors.append("seed must be a nonnegative integer")
-    if dotted(config, "model.id") != "Qwen/Qwen3-1.7B-Base":
-        errors.append("model.id must be the locked Qwen/Qwen3-1.7B-Base checkpoint")
-    if dotted(config, "model.max_model_len") != 32768:
-        errors.append("model.max_model_len must be 32768")
+    if dotted(config, "model.id") not in SUPPORTED_MODELS:
+        errors.append("model.id must be an approved checkpoint: " + ", ".join(SUPPORTED_MODELS))
+    context = dotted(config, "model.max_model_len")
+    prompt_limit = dotted(config, "prompt.max_tokens")
+    if type(context) is not int or context <= 0:
+        errors.append("model.max_model_len must be a positive integer")
+    if prompt_limit is not None and (type(prompt_limit) is not int or prompt_limit <= 0):
+        errors.append("prompt.max_tokens must be a positive integer")
     if dotted(config, "model.dtype") not in ("bfloat16", "float16", "float32"):
         errors.append("model.dtype must be bfloat16, float16, or float32")
+    tensor_parallel_size = dotted(config, "generation.tensor_parallel_size")
+    if type(tensor_parallel_size) is not int or tensor_parallel_size <= 0:
+        errors.append("generation.tensor_parallel_size must be a positive integer")
+    if type(config.get("generation", {}).get("parallel_splits", False)) is not bool:
+        errors.append("generation.parallel_splits must be a boolean")
+    generation = config.get("generation", {})
+    replicas = generation.get("replicas_per_split", 1)
+    if type(replicas) is not int or replicas <= 0:
+        errors.append("generation.replicas_per_split must be a positive integer")
+    if not generation.get("parallel_splits", False) and replicas != 1:
+        errors.append("generation.replicas_per_split must be 1 when parallel_splits is false")
+    if generation.get("dispatch_mode", "batch") not in ("batch", "continuous"):
+        errors.append("generation.dispatch_mode must be batch or continuous")
+    for name in ("max_in_flight", "request_chunk_size", "max_num_seqs", "max_num_batched_tokens"):
+        value = generation.get(name)
+        if value is not None and (type(value) is not int or value <= 0):
+            errors.append(f"generation.{name} must be a positive integer")
+    if "enable_chunked_prefill" in generation and type(generation["enable_chunked_prefill"]) is not bool:
+        errors.append("generation.enable_chunked_prefill must be a boolean")
+    math_profile = round_id == "round1" and MATH_DATASET_ID in (
+        dotted(config, "train.id"),
+        dotted(config, "heldout.id"),
+    )
     expected = {"round1": (64, 30, "MathArena/hmmt_feb_2025"), "round2": (128, 100, "RUC-AIBOX/OlymMATH")}
-    if round_id in expected:
+    if math_profile:
+        for section, split, n_problem, expected_rows in (("train", "train", 500, 7500), ("heldout", "test", 500, 500)):
+            profile = {
+                "id": MATH_DATASET_ID,
+                "config": "default",
+                "split": split,
+                "adapter": "math",
+                "selection": "sample" if section == "train" else "all",
+                "n_problem": n_problem,
+                "expected_rows": expected_rows,
+            }
+            for key, value in profile.items():
+                if dotted(config, f"{section}.{key}") != value:
+                    errors.append(f"MATH Round 1 requires {section}.{key}={value!r}")
+            revision = dotted(config, f"{section}.revision")
+            if not re.fullmatch(r"[0-9a-fA-F]{40}", str(revision)):
+                errors.append(f"{section}.revision must be an immutable 40-character commit SHA")
+        if dotted(config, "train.revision") != dotted(config, "heldout.revision"):
+            errors.append("MATH Round 1 requires train and held-out splits from the same immutable revision")
+    elif round_id in expected:
         train_count, heldout_count, heldout_id = expected[round_id]
         if dotted(config, "train.n_problem") != train_count or dotted(config, "heldout.n_problem") != heldout_count:
             errors.append(
@@ -150,8 +218,15 @@ def validate_config(config, *, enable_round2=False):
             errors.append(f"{field} must be finite and positive")
     if sampling.get("max_new_tokens") is not None and type(sampling["max_new_tokens"]) is not int:
         errors.append("sampling.max_new_tokens must be an integer")
-    if isinstance(sampling.get("max_new_tokens"), int) and sampling["max_new_tokens"] >= 32768:
-        errors.append("max_new_tokens must leave room for the prompt within 32768; prompts are never truncated")
+    new_tokens = sampling.get("max_new_tokens")
+    if type(context) is int and context > 0 and type(new_tokens) is int:
+        if new_tokens >= context:
+            errors.append(
+                "sampling.max_new_tokens must leave room for the prompt within model.max_model_len; "
+                "prompts are never truncated"
+            )
+        if type(prompt_limit) is int and prompt_limit > 0 and prompt_limit + new_tokens > context:
+            errors.append("prompt.max_tokens + sampling.max_new_tokens must fit within model.max_model_len")
     wrapper = dotted(config, "prompt.wrapper_file")
     if wrapper and not Path(wrapper).is_file():
         errors.append(f"Approved wrapper file is missing: {wrapper}")
@@ -167,6 +242,11 @@ def validate_config(config, *, enable_round2=False):
         errors.append("verifier.answer_format must be auto or boxed")
     if dotted(config, "features.backend") not in FEATURE_GEOMETRIES:
         errors.append("features.backend must be delta_proxy (DelTA) or exact_tiled_head")
+    retention = config.get("features", {}).get("factor_cache_retention", "all")
+    if retention not in ("all", "group"):
+        errors.append("features.factor_cache_retention must be all or group")
+    if retention == "group" and dotted(config, "features.backend") != "delta_proxy":
+        errors.append("features.factor_cache_retention=group requires delta_proxy; use all for exact_tiled_head")
     if errors:
         raise ConfigurationError("Required configuration/preflight decisions:\n- " + "\n- ".join(errors))
     return copy.deepcopy(config)

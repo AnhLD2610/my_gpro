@@ -58,8 +58,9 @@ def main(argv=None):
     base = Path(__file__).resolve().parents[1]
     # Use filename only to open a log even if YAML or required dependencies fail to load.
     label = "round_cpu_smoke" if args.cpu_smoke else ("round2" if "round2" in args.config.name else "round1")
+    directory = "round1_qwen25math7b_math500_test500_p1024_g3072" if label == "round1" else label
     output = (
-        args.output_dir or Path(os.environ.get("NASH_OUTPUT_DIR", base / "artifacts" / "diagnostic_b" / label))
+        args.output_dir or Path(os.environ.get("NASH_OUTPUT_DIR", base / "artifacts" / "diagnostic_b" / directory))
     ).resolve()
     output.mkdir(parents=True, exist_ok=True)
     logfile = output / f"diagnostic_b_{label}.log"

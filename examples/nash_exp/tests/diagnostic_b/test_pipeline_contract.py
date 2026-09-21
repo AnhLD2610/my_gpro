@@ -175,6 +175,32 @@ def test_switching_to_delta_reuses_generation_and_rebuilds_features(tmp_path, mo
     assert storage.read_json(tmp_path / "heldout.json")["backend"] == "delta_proxy"
 
 
+def test_split_scheduling_change_reuses_completed_generation_stage(tmp_path, monkeypatch):
+    from diagnostic_b import generation
+
+    config = _synthetic_config() | {"generation": {"parallel_splits": False}}
+    storage.atomic_json(tmp_path / "model_lock.json", {"revision": "pinned", "tokenizer_revision": "pinned"})
+    marker = tmp_path / "prepared.json"
+    storage.atomic_json(marker, {"fixed_prompts": True})
+    storage.StageRunner(tmp_path).run("prepare", {"fixed": True}, lambda: [marker], immutable=True)
+    calls = []
+
+    def generate_shared(config, root, lock):
+        calls.append(config["generation"]["parallel_splits"])
+        path = root / "cached_responses.json"
+        storage.atomic_json(path, {"responses": "fixed synthetic rollouts"}, immutable=True)
+        return [path]
+
+    monkeypatch.setattr(generation, "generate_shared", generate_shared)
+    pipeline.run_stage("generate", config, tmp_path, resume=True)
+    cache = tmp_path / "cached_responses.json"
+    before = (storage.file_hash(cache), cache.stat().st_mtime_ns)
+    config["generation"]["parallel_splits"] = True
+    pipeline.run_stage("generate", config, tmp_path, resume=True)
+    assert calls == [False]
+    assert (storage.file_hash(cache), cache.stat().st_mtime_ns) == before
+
+
 def test_pipeline_support_and_added_support_match_explicit_vectors(tmp_path, monkeypatch):
     config = _synthetic_config()
     basis = np.array([[1.0, 0.0, 1.0], [0.0, 1.0, 0.3]])

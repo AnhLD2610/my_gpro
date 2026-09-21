@@ -1,0 +1,6 @@
+{
+  "system": null,
+  "user_template": "{problem}\n\nLet's think step by step and output the final answer within \\boxed{{}}.",
+  "apply_to_existing_user_message": true,
+  "chat_template_kwargs": {}
+}

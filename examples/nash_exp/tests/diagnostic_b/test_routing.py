@@ -6,9 +6,12 @@ import inspect
 
 import numpy as np
 import pytest
+from diagnostic_b import routing
 from diagnostic_b.routing import (
+    RouteSolution,
     SolverConfig,
     TrainingGeometry,
+    _audit_measured_route,
     collision_powers,
     solve_group,
     standardized_advantages,
@@ -105,6 +108,14 @@ def test_witness_powers_strict_nash_linear_and_constraints():
         assert np.min(route.utilities) >= 1 - config.feasibility_tolerance
         assert route.diagnostics["objective_gap"] <= config.objective_tolerance + 1e-8
 
+    # Independent global welfare certificate: relaxing every constraint except
+    # the unit ball gives gap <= ||grad F(x)|| - grad F(x).x by concavity.
+    # This witness reaches that upper bound, not merely a feasible log score.
+    unit_players = atoms[:, :3] / normp
+    x = atoms @ result.ncr.coefficients / result.radius
+    gradient = unit_players @ (result.powers / (1 + unit_players.T @ x))
+    assert np.linalg.norm(gradient) - gradient @ x <= 2e-8
+
 
 def test_scalar_linear_tie_break_does_not_freeze_arbitrary_utilities():
     # Maximal x refund is fixed; y refund is arbitrary for welfare, so min-norm sets y=0.
@@ -181,16 +192,116 @@ def test_tiny_psd_repair_cannot_hide_invalid_measured_radius_after_cancellation(
     result = solve_group(geometry, 0.5)
     assert result.diagnostics["gram_min_eigenvalue"] < 0
     assert result.baseline_norm > SolverConfig().zero_norm_tolerance
-    assert result.linear.reason == "INVALID_MEASURED_GEOMETRY_FEASIBILITY"
-    if residual_mass == 1e-5:
+    # Solver scaling can reject this ill-conditioned case before the measured
+    # audit. Either path must preserve GRPO; test the measured guard below too.
+    assert result.linear.reason in ("INVALID_MEASURED_GEOMETRY_FEASIBILITY", "INVALID_ROUTE_OBJECTIVE_GAP")
+    if residual_mass == 1e-5 and result.linear.reason == "INVALID_MEASURED_GEOMETRY_FEASIBILITY":
         assert result.linear.diagnostics["measured_baseline_norm_squared"] < 0
-    else:
+    elif residual_mass == 1e-4:
         assert result.linear.diagnostics["measured_baseline_norm_squared"] > 0
         assert result.linear.diagnostics["measured_relative_radius_residual"] > SolverConfig().feasibility_tolerance
     for route in (result.linear, result.ncr):
         assert route.fallback
         assert route.diagnostics["solve_attempted"]
         np.testing.assert_array_equal(route.coefficients, [0, 0])
+
+    # This correction saturates the repaired radius, but violates the original
+    # measured radius after cancellation. Audit it independently of convergence.
+    coefficients = np.array([0, residual_mass / 2])
+    candidate = RouteSolution(
+        coefficients,
+        np.ones(1),
+        coefficients[1:] / geometry.negative_coefficients,
+        np.ones(1),
+        coefficients[1:],
+        np.ones(1),
+        False,
+        None,
+    )
+    audited = _audit_measured_route(
+        gram,
+        result.baseline_coefficients,
+        geometry.positive_coefficients,
+        geometry.negative_coefficients,
+        candidate,
+        0.5,
+        SolverConfig(),
+    )
+    assert audited.reason == "INVALID_MEASURED_GEOMETRY_FEASIBILITY"
+    np.testing.assert_array_equal(audited.coefficients, [0, 0])
+
+
+def test_ncr_single_player_monotone_welfare_and_minimum_norm():
+    atoms = np.array([[1, 1, 0], [0, 0, 1]], dtype=float)
+    result = solve_group(TrainingGeometry(atoms.T @ atoms, np.ones(1), np.array([0.2, 0.2])), 1)
+    assert not result.ncr.fallback, result.ncr.reason
+    np.testing.assert_allclose(atoms @ result.ncr.coefficients, [0.2, 0], atol=1e-4)
+    assert result.ncr.diagnostics["objective_value"] == pytest.approx(np.log(result.ncr.utilities[0]))
+    assert result.ncr.diagnostics["tie_break_constraint"] == "fixed_utilities"
+
+
+@pytest.mark.parametrize("scale", [1e-4, 1, 1e4])
+def test_ncr_utility_face_and_scale_invariance(scale):
+    atoms, geometry = witness()
+    scaled = TrainingGeometry(geometry.gram * scale**2, geometry.positive_coefficients, geometry.negative_coefficients)
+    result = solve_group(scaled, 0.5)
+    assert not result.ncr.fallback, result.ncr.reason
+    route = result.ncr
+    np.testing.assert_allclose(route.utilities, route.diagnostics["first_stage_utilities"], atol=2e-8, rtol=0)
+    # Independently evaluate welfare in the explicit feature geometry.
+    norms = np.linalg.norm(atoms[:, :3], axis=0)
+    utilities = 1 + atoms[:, :3].T @ (atoms @ route.coefficients) / (norms * result.radius / scale)
+    np.testing.assert_allclose(route.utilities, utilities, atol=1e-7)
+    assert route.diagnostics["objective_value"] == pytest.approx(result.powers @ np.log(utilities), abs=1e-8)
+    for stage in ("first_stage_solver", "tie_break_solver"):
+        attempt = route.diagnostics[stage]["attempts"][-1]
+        assert 0 < attempt["iterations"] <= 500
+        assert attempt["options"]["max_iter"] == 500
+
+
+def test_ncr_no_improving_direction_returns_zero_correction():
+    atoms = np.array([[1, 1, 1, -1, -2]], dtype=float)
+    geometry = TrainingGeometry(atoms.T @ atoms, np.full(3, 0.1), np.full(2, 0.15))
+    result = solve_group(geometry, 0.4)
+    assert not result.ncr.fallback, result.ncr.reason
+    np.testing.assert_allclose(atoms @ result.ncr.coefficients, [0], atol=1e-8)
+    np.testing.assert_allclose(result.ncr.utilities, np.ones(3), atol=1e-8)
+
+
+def test_bounded_log_recovery_preserves_nash_optimum(monkeypatch):
+    import cvxpy as cp
+
+    original = routing._optimize
+
+    def stall_direct_log(problem, config):
+        if isinstance(problem.objective, cp.Maximize) and not problem.objective.expr.is_affine():
+            raise routing.SolverFailure(
+                "synthetic numerical stall",
+                {"attempts": [{"native_status": "InsufficientProgress", "iterations": 7}]},
+            )
+        return original(problem, config)
+
+    monkeypatch.setattr(routing, "_optimize", stall_direct_log)
+    atoms, geometry = witness()
+    result = solve_group(geometry, 0.5)
+    assert not result.ncr.fallback, result.ncr.reason
+    attempts = result.ncr.diagnostics["first_stage_solver"]["attempts"]
+    assert attempts[0]["native_status"] == "InsufficientProgress"
+    assert attempts[-1]["formulation"] == "bounded_log_utilities"
+    unit_players = atoms[:, :3] / np.linalg.norm(atoms[:, :3], axis=0)
+    x = atoms @ result.ncr.coefficients / result.radius
+    gradient = unit_players @ (result.powers / (1 + unit_players.T @ x))
+    assert np.linalg.norm(gradient) - gradient @ x <= 2e-8
+
+
+def test_iteration_limit_and_failed_stage_are_reported():
+    result = solve_group(TrainingGeometry(np.eye(2), np.ones(1), np.ones(1)), 0.5, SolverConfig(max_iterations=1))
+    assert result.ncr.fallback
+    assert result.ncr.diagnostics["failed_stage"] == "welfare"
+    attempts = result.ncr.diagnostics["first_stage_solver"]["attempts"]
+    assert len(attempts) == 1
+    assert attempts[0]["native_status"] == "MaxIterations"
+    assert attempts[0]["iterations"] == attempts[0]["options"]["max_iter"] == 1
 
 
 def test_power_failure_uses_matched_baseline_fallbacks():

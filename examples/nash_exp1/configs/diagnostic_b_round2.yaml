@@ -1,0 +1,62 @@
+# Frozen-checkpoint Diagnostic B. Author-selected settings; response/context conflict must be resolved.
+round_id: round2
+enabled: false
+seed: 42
+n_rollout: 32
+model:
+  id: Qwen/Qwen3-1.7B-Base
+  revision: main  # Resolve once to a commit SHA and lock before generation.
+  tokenizer_revision: null  # Same immutable commit as the model.
+  local_path: null
+  dtype: bfloat16
+  max_model_len: 32768
+train:
+  id: sungyub/dapo-math-17k-verl
+  revision: 3cf5c112137795c1f1d5fdae7c747871b26840a4  # Pinned dataset snapshot.
+  local_path: null
+  config: default
+  split: train
+  n_problem: 128
+heldout:
+  id: RUC-AIBOX/OlymMATH
+  revision: main  # Resolved once to a commit SHA before sampling.
+  config: en-hard
+  split: test
+  n_problem: 100
+prompt:
+  wrapper_file: boxed_prompt.json  # Applied to train and held-out user messages.
+sampling:
+  max_new_tokens: 32768  # Requested response cap; prompt also needs context space.
+  temperature: 1.0
+  top_p: 1.0
+  top_k: -1
+  min_p: 0.0
+generation:
+  tensor_parallel_size: 1
+  request_chunk_size: 32
+  gpu_memory_utilization: 0.8
+  enable_prefix_caching: true
+verifier:
+  backend: math_verify
+  answer_format: boxed  # Verify the final boxed answer; no unboxed fallback.
+  callable: null
+  timeout_seconds: 30
+routing:
+  radius_coefficient: 0.4
+  epsilon: 0.000001  # Same stabilizer as veRL core_algos.py; std uses divisor G.
+  solver: {}
+features:
+  backend: delta_proxy  # Author-requested DelTA Appendix F: (1 - p_y) * hidden.
+  token_chunk_size: 128
+  vocab_chunk_size: 128  # Used only by the optional exact_tiled_head backend.
+  logit_vocab_chunk_size: 8192  # Full-vocabulary normalizers for sampled-token probabilities.
+  max_segments_per_response_budget: 128  # Preflight estimate only; never truncates segments.
+memory:
+  gpu_budget_gib: null  # Detect free GPU memory when null.
+  cpu_budget_gib: null  # Detect available system RAM when null.
+  disk_budget_gib: null  # Detect free artifact-volume space when null.
+  safety_fraction: 0.8
+statistics:
+  bootstrap_replicates: 2000
+  bootstrap_seed: null  # Derived from the required master seed.
+  active_tolerance: 0.00001

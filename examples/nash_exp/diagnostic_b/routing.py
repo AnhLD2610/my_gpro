@@ -10,10 +10,13 @@ Solver arithmetic is float64; upstream feature contractions must accumulate
 at least in FP32. Numerical PSD repairs are limited to roundoff and recorded.
 """
 
+import logging
 from dataclasses import asdict, dataclass, field
 from typing import Any
 
 import numpy as np
+
+LOG = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -34,6 +37,13 @@ class SolverConfig:
     zero_norm_tolerance: float = 1e-12
     solver_tolerance: float = 1e-9
     max_iterations: int = 500
+    max_threads: int = 1
+
+    def __post_init__(self):
+        if not isinstance(self.max_iterations, int) or self.max_iterations < 1:
+            raise ValueError("max_iterations must be a positive integer")
+        if not isinstance(self.max_threads, int) or self.max_threads < 0:
+            raise ValueError("max_threads must be a nonnegative integer (0 means automatic)")
 
 
 DEFAULT_SOLVER_CONFIG = SolverConfig()
@@ -101,7 +111,41 @@ def _psd(matrix: np.ndarray, config: SolverConfig) -> tuple[np.ndarray, np.ndarr
     return root.T @ root, root, diagnostics
 
 
-def _optimize(problem: Any, config: SolverConfig) -> None:
+class SolverFailure(RuntimeError):
+    """Preserve solve diagnostics even when CVXPY raises before setting stats."""
+
+    def __init__(self, message, diagnostics):
+        super().__init__(message)
+        self.diagnostics = diagnostics
+
+
+def _solver_attempt(problem, config, options):
+    stats = problem.solver_stats
+    details = {
+        "solver": config.solver,
+        "status": problem.status,
+        "iterations": stats.num_iters if stats else None,
+        "solve_time": stats.solve_time if stats else None,
+        "options": dict(options),
+    }
+    # CVXPY leaves solver_stats unset on Clarabel's InsufficientProgress.
+    # Its optional native cache lets us retain the stopping reason/residuals.
+    native = getattr(problem, "_solver_cache", {}).get("CLARABEL") if config.solver == "CLARABEL" else None
+    if native is not None and hasattr(native, "get_info"):
+        info = native.get_info()
+        details.update(
+            native_status=str(info.status),
+            iterations=int(info.iterations),
+            solve_time=float(info.solve_time),
+            primal_residual=float(info.res_primal),
+            dual_residual=float(info.res_dual),
+            absolute_gap=float(info.gap_abs),
+            relative_gap=float(info.gap_rel),
+        )
+    return details
+
+
+def _optimize(problem: Any, config: SolverConfig) -> dict:
     import cvxpy as cp
 
     if config.solver not in cp.installed_solvers():
@@ -113,12 +157,31 @@ def _optimize(problem: Any, config: SolverConfig) -> None:
             "tol_gap_rel": config.solver_tolerance,
             "tol_feas": config.solver_tolerance,
             "max_iter": config.max_iterations,
+            "max_threads": config.max_threads,
         }
     elif config.solver == "SCS":
-        options = {"eps": config.solver_tolerance, "max_iters": config.max_iterations * 100}
-    problem.solve(solver=config.solver, verbose=False, **options)
-    if problem.status not in (cp.OPTIMAL, cp.OPTIMAL_INACCURATE):
-        raise RuntimeError(f"SOLVE_FAILED: status={problem.status}")
+        options = {"eps": config.solver_tolerance, "max_iters": config.max_iterations}
+    attempts = []
+    settings = [options]
+    if config.solver == "CLARABEL":
+        # A fresh solve without automatic equilibration can recover early
+        # numerical stalls in exponential cones. Same problem and tolerances.
+        settings.append({**options, "equilibrate_enable": False})
+    for attempt_options in settings:
+        error = None
+        try:
+            problem.solve(solver=config.solver, verbose=False, warm_start=False, **attempt_options)
+        except cp.error.SolverError as exc:
+            error = str(exc)
+        details = _solver_attempt(problem, config, attempt_options)
+        details["error"] = error
+        attempts.append(details)
+        if error is None and problem.status in (cp.OPTIMAL, cp.OPTIMAL_INACCURATE):
+            return {"status": problem.status, "attempts": attempts}
+        LOG.warning("Routing solve failed: %s", details)
+        if details.get("native_status") not in ("InsufficientProgress", "NumericalError"):
+            break
+    raise SolverFailure(f"SOLVE_FAILED: {attempts[-1]}", {"attempts": attempts})
 
 
 def _ratio_matrix(m: int) -> np.ndarray:
@@ -197,7 +260,7 @@ def collision_powers(
         cp.quad_form(centered, cp.psd_wrap(tangent_collision)) + 2 * (tangent @ collision @ uniform) @ centered
     ) / objective_scale
     first = cp.Problem(cp.Minimize(first_objective), constraints)
-    _optimize(first, config)
+    first_solver = _optimize(first, config)
     q0 = np.asarray(q.value).copy()
     first_residual = max(abs(float(q0.sum() - 1)), -float(q0.min()), float((ratio @ q0).max()))
     if not np.isfinite(q0).all() or first_residual > config.feasibility_tolerance:
@@ -212,7 +275,7 @@ def collision_powers(
     face_rows = vectors[:, retained].T
     face = face_rows @ q == face_rows @ q0
     second = cp.Problem(cp.Minimize(cp.sum_squares(q - uniform)), [*constraints, face])
-    _optimize(second, config)
+    second_solver = _optimize(second, config)
     answer = np.asarray(q.value).copy()
     final_gap = _power_certificate(collision, answer, ratio)
     residual = max(abs(float(answer.sum() - 1)), -float(answer.min()), float((ratio @ answer).max()))
@@ -242,6 +305,8 @@ def collision_powers(
         numerical_rank=int(retained.sum()),
         rank_threshold=rank_threshold,
         first_objective_scale=objective_scale,
+        first_stage_solver=first_solver,
+        tie_break_solver=second_solver,
     )
     return answer, diagnostics
 
@@ -290,16 +355,98 @@ def _route(h, root, b, a, beta, powers, radius, baseline_norm, objective, config
             constraints.append(xi[np.flatnonzero(beta == 0)] == 0)
     if np.any(a == 0):
         constraints.append(w[np.flatnonzero(a == 0)] == 0)
-    welfare = powers @ utilities if objective == "linear" else powers @ cp.log(utilities)
+    # With one player, log is strictly increasing: the welfare maximizers
+    # are exactly the linear maximizers. Avoid an unnecessary exponential cone.
+    welfare = powers @ utilities if objective == "linear" or m == 1 else powers @ cp.log(utilities)
     first = cp.Problem(cp.Maximize(welfare), constraints)
-    _optimize(first, config)
-    first_value = float(welfare.value)
-    # Retain only scalar welfare for the linear control, never its arbitrary utility vector.
-    second = cp.Problem(
-        cp.Minimize(cp.sum_squares(root @ delta / radius) / 2),
-        [*constraints, welfare >= first_value - config.objective_tolerance],
+    try:
+        try:
+            first_solver = _optimize(first, config)
+            for attempt in first_solver["attempts"]:
+                attempt["formulation"] = "direct_welfare"
+        except SolverFailure as direct_failure:
+            direct_attempts = direct_failure.diagnostics["attempts"]
+            for attempt in direct_attempts:
+                attempt["formulation"] = "direct_welfare"
+            if (
+                objective != "ncr"
+                or m == 1
+                or direct_attempts[-1].get("native_status") not in ("InsufficientProgress", "NumericalError")
+            ):
+                raise
+            # Equivalent bounded exponential-cone representation. Protection
+            # and the radius imply 1 <= u <= 2, hence 0 <= log(u) <= log(2).
+            # These redundant bounds can stabilize a stalled direct log solve.
+            bounded_utilities, log_utilities = cp.Variable(m), cp.Variable(m)
+            first = cp.Problem(
+                cp.Maximize(powers @ log_utilities),
+                [
+                    *constraints,
+                    bounded_utilities == utilities,
+                    bounded_utilities >= 1,
+                    bounded_utilities <= 2,
+                    log_utilities >= 0,
+                    log_utilities <= np.log(2),
+                    cp.constraints.ExpCone(log_utilities, np.ones(m), bounded_utilities),
+                ],
+            )
+            try:
+                first_solver = _optimize(first, config)
+            except SolverFailure as bounded_failure:
+                for attempt in bounded_failure.diagnostics["attempts"]:
+                    attempt["formulation"] = "bounded_log_utilities"
+                bounded_failure.diagnostics["attempts"] = direct_attempts + bounded_failure.diagnostics["attempts"]
+                raise
+            for attempt in first_solver["attempts"]:
+                attempt["formulation"] = "bounded_log_utilities"
+            first_solver["attempts"] = direct_attempts + first_solver["attempts"]
+    except SolverFailure as exc:
+        return _fallback(
+            h,
+            b,
+            a,
+            beta,
+            str(exc),
+            {
+                "solve_attempted": True,
+                "failed_stage": "welfare",
+                "objective": objective,
+                "first_stage_solver": exc.diagnostics,
+            },
+        )
+    first_utilities = 1 + h[:m] @ np.asarray(delta.value, dtype=np.float64) / (radius * norms)
+    first_value = float(welfare.value) if objective == "linear" else float(powers @ np.log(first_utilities))
+    # Positive powers make Nash welfare strictly concave in utilities, so all
+    # welfare maximizers have the same utility vector. Fix that vector for
+    # NCR's minimum-norm tie-break, avoiding a near-tangent log superlevel set.
+    # Linear welfare is not strictly concave: retain only its scalar value.
+    optimal_face = (
+        welfare >= first_value - config.objective_tolerance if objective == "linear" else utilities == first_utilities
     )
-    _optimize(second, config)
+    second = cp.Problem(
+        # h = root.T @ root. Use its quadratic form directly to avoid an
+        # additional dense set of auxiliary equalities for the norm objective.
+        cp.Minimize(cp.quad_form(delta / radius, cp.psd_wrap(h)) / 2),
+        [*constraints, optimal_face],
+    )
+    try:
+        second_solver = _optimize(second, config)
+    except SolverFailure as exc:
+        return _fallback(
+            h,
+            b,
+            a,
+            beta,
+            str(exc),
+            {
+                "solve_attempted": True,
+                "failed_stage": "tie_break",
+                "objective": objective,
+                "first_stage_objective": first_value,
+                "first_stage_solver": first_solver,
+                "tie_break_solver": exc.diagnostics,
+            },
+        )
     coefficients = np.asarray(delta.value, dtype=np.float64).reshape(-1)
     shares = np.asarray(w.value, dtype=np.float64).reshape(-1)
     refunds = np.asarray(xi.value, dtype=np.float64).reshape(-1) if s else np.empty(0)
@@ -313,6 +460,11 @@ def _route(h, root, b, a, beta, powers, radius, baseline_norm, objective, config
         "solve_attempted": True,
         "status": second.status,
         "first_stage_status": first.status,
+        "first_stage_solver": first_solver,
+        "tie_break_solver": second_solver,
+        "tie_break_constraint": "scalar_welfare" if objective == "linear" else "fixed_utilities",
+        "first_stage_utilities": first_utilities.tolist(),
+        "utility_face_residual": float(np.max(np.abs(final_utilities - first_utilities))),
         "objective": objective,
         "first_stage_objective": first_value,
         "objective_value": final_value,
@@ -348,6 +500,7 @@ def _route(h, root, b, a, beta, powers, radius, baseline_norm, objective, config
         -float((added / radius).min()),
         1 - diagnostics["minimum_utility"],
         diagnostics["maximum_utility"] - 2,
+        diagnostics["utility_face_residual"] if objective == "ncr" else 0,
     )
     values = np.concatenate([coefficients, shares, refunds, final_utilities, [final_value]])
     if not np.isfinite(values).all() or badness > config.feasibility_tolerance:

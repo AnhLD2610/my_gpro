@@ -53,7 +53,9 @@ def test_production_delta_aggregate_gram_and_heldout_match_reference(tmp_path, m
     extractor, path, hidden, weight, ids = _toy_extractor(tmp_path, extractor_class=DeltaProxyExtractor)
     # Once factors exist, DelTA needs neither full-head aggregation nor logits again.
     monkeypatch.setattr(extractor, "aggregate_row_block", lambda *args: pytest.fail("full-head aggregation used"))
-    monkeypatch.setattr(extractor, "_log_normalizers", lambda *args: pytest.fail("recomputed cached probabilities"))
+    monkeypatch.setattr(
+        extractor, "_normalization_factors", lambda *args: pytest.fail("recomputed cached probabilities")
+    )
     atom = HeadAtom(path, weights)
     expected = delta_proxy_aggregate(hidden, hidden @ weight.T, ids, weights)
     summed = delta_proxy_aggregate(hidden, hidden @ weight.T, ids)

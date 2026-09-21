@@ -50,6 +50,14 @@ def adapt_row(row, dataset_kind, row_index):
         answer = row["reward_model"].get("ground_truth")
         extra = row.get("extra_info") or {}
         row_id = extra.get("index", row_index)
+    elif dataset_kind == "math":
+        if not isinstance(row.get("problem"), str) or not isinstance(row.get("solution"), str):
+            raise ConfigurationError("MATH schema requires problem and solution strings")
+        boxed = last_boxed_answer(row["solution"])
+        if boxed is None:
+            raise ConfigurationError(f"MATH solution row {row_index} has no valid final boxed answer")
+        problem, answer, messages = row["problem"], boxed[len(r"\boxed{") : -1], None
+        row_id = row.get("id", row.get("index", row_index))
     elif dataset_kind in ("hmmt", "olymmath"):
         # Official HMMT and OlymMATH exports use problem/answer (some HMMT exports capitalize).
         schemas = [("problem", "answer"), ("Problem", "Answer")]
@@ -148,11 +156,12 @@ def load_dataset_snapshot(spec, *, require_immutable=False):
     local = spec.get("local_path")
     requested = spec.get("revision")
     if not local and require_immutable and not re.fullmatch(r"[0-9a-fA-F]{40}", requested or ""):
-        raise ConfigurationError("DAPO revision must be an immutable 40-character commit SHA, or use local_path")
+        raise ConfigurationError("Dataset revision must be an immutable 40-character commit SHA, or use local_path")
 
     from datasets import load_dataset, load_from_disk
     from huggingface_hub import HfApi
 
+    source_files = None
     if local:
         content = local_snapshot(local)
         if Path(local).is_file():
@@ -164,7 +173,27 @@ def load_dataset_snapshot(spec, *, require_immutable=False):
         revision = "sha256:" + digest(content)
     else:
         revision = HfApi().dataset_info(spec["id"], revision=requested).sha
-        dataset = load_dataset(spec["id"], name=spec.get("config"), split=spec["split"], revision=revision)
+        data_files = spec.get("data_files")
+        if data_files is not None:
+            # Explicit shards avoid stale dataset-card split counts while keeping
+            # file loading checks, the immutable revision, and content hashes.
+            from huggingface_hub import hf_hub_download
+
+            if (
+                not isinstance(data_files, list)
+                or not data_files
+                or any(not isinstance(name, str) or not name.endswith(".parquet") for name in data_files)
+            ):
+                raise ConfigurationError("data_files must be a nonempty list of Parquet paths in the dataset repo")
+            paths = [
+                hf_hub_download(spec["id"], filename=name, repo_type="dataset", revision=revision)
+                for name in data_files
+            ]
+            source_files = {name: file_hash(path) for name, path in zip(data_files, paths, strict=True)}
+            dataset = load_dataset("parquet", data_files={spec["split"]: paths}, split=spec["split"])
+            LOG.info("Loaded pinned Parquet files: dataset=%s revision=%s rows=%s", spec["id"], revision, len(dataset))
+        else:
+            dataset = load_dataset(spec["id"], name=spec.get("config"), split=spec["split"], revision=revision)
         content = None
     schema = dataset.features.to_dict()
     return dataset, {
@@ -173,14 +202,43 @@ def load_dataset_snapshot(spec, *, require_immutable=False):
         "split": spec["split"],
         "config": spec.get("config"),
         "local_files": content,
+        "source_files": source_files,
         "schema": schema,
         "rows": len(dataset),
     }
 
 
-def prepare_manifests(config, output_dir, model_lock):
-    """Select the immutable D sample and all Q rows before generation/model loading."""
+def select_row_indices(spec, row_count, seed, *, split):
+    """Select fixed rows without replacement, with an independent held-out RNG."""
     import numpy as np
+
+    expected = spec.get("expected_rows")
+    if expected is not None and row_count != expected:
+        raise ConfigurationError(f"{split} dataset must contain exactly {expected} rows, got {row_count}")
+    count = spec["n_problem"]
+    if type(count) is not int or count <= 0 or count > row_count:
+        raise ConfigurationError(f"{split} sample size must be between 1 and {row_count}, got {count}")
+    mode = spec.get("selection", "sample" if split == "train" else "all")
+    policy = {"mode": mode, "population_rows": row_count, "sample_size": count, "replace": False}
+    if mode == "all":
+        if count != row_count:
+            raise ConfigurationError(f"{split} selection=all requires exactly {count} rows, got {row_count}")
+        return list(range(row_count)), {**policy, "seed": None, "rng": None}
+    if mode != "sample":
+        raise ConfigurationError(f"{split}.selection must be sample or all")
+    # Preserve historical training selections. Held-out selection has a separate
+    # stream so changing the training sample count cannot change the test set.
+    rng_seed = seed if split == "train" else np.random.SeedSequence([seed, 1])
+    indices = np.random.default_rng(rng_seed).choice(row_count, count, replace=False).tolist()
+    return indices, {
+        **policy,
+        "seed": seed,
+        "rng": "numpy.default_rng(seed)" if split == "train" else "numpy.default_rng(SeedSequence([seed, 1]))",
+    }
+
+
+def prepare_manifests(config, output_dir, model_lock):
+    """Select immutable training and held-out rows before generation/model loading."""
     from transformers import AutoTokenizer
 
     root = Path(output_dir)
@@ -191,21 +249,27 @@ def prepare_manifests(config, output_dir, model_lock):
     )
     train, train_info = load_dataset_snapshot(config["train"], require_immutable=True)
     heldout, heldout_info = load_dataset_snapshot(config["heldout"])
-    if len(heldout) != config["heldout"]["n_problem"]:
-        raise ConfigurationError(
-            f"Held-out dataset must contain exactly {config['heldout']['n_problem']} rows, got {len(heldout)}"
-        )
-    count = config["train"]["n_problem"]
-    if len(train) < count:
-        raise ConfigurationError("DAPO snapshot has fewer rows than the locked sample size")
-    selected = np.random.default_rng(config["seed"]).choice(len(train), count, replace=False).tolist()
-    train_rows = [adapt_row(train[index], "dapo", index) for index in selected]
-    heldout_kind = "hmmt" if config["round_id"] == "round1" else "olymmath"
-    heldout_rows = [adapt_row(heldout[index], heldout_kind, index) for index in range(len(heldout))]
+    selected, train_selection = select_row_indices(config["train"], len(train), config["seed"], split="train")
+    heldout_selected, heldout_selection = select_row_indices(
+        config["heldout"], len(heldout), config["seed"], split="heldout"
+    )
+    train_kind = config["train"].get("adapter", "dapo")
+    heldout_kind = config["heldout"].get("adapter", "hmmt" if config["round_id"] == "round1" else "olymmath")
+    train_rows = [adapt_row(train[index], train_kind, index) for index in selected]
+    heldout_rows = [adapt_row(heldout[index], heldout_kind, index) for index in heldout_selected]
+    for info, kind in ((train_info, train_kind), (heldout_info, heldout_kind)):
+        info["adapter"] = kind
+        if kind == "math":
+            info["answer_extraction"] = "last_boxed_solution"
     check_overlap(train_rows, heldout_rows)
     for rows, split in ((train_rows, "train"), (heldout_rows, "heldout")):
         for index, row in enumerate(rows):
             rows[index] = {**render_prompt(row, tokenizer, wrapper), "prompt_index": index, "split": split}
+            prompt_limit = config["prompt"].get("max_tokens")
+            if prompt_limit is not None and rows[index]["prompt_token_count"] > prompt_limit:
+                raise ConfigurationError(
+                    f"Prompt {split}/{index} exceeds prompt.max_tokens={prompt_limit}; no truncation applied"
+                )
             if (
                 rows[index]["prompt_token_count"] + config["sampling"]["max_new_tokens"]
                 > config["model"]["max_model_len"]
@@ -223,10 +287,13 @@ def prepare_manifests(config, output_dir, model_lock):
         "train": train_info,
         "heldout": heldout_info,
         "train_row_indices": selected,
+        "heldout_row_indices": heldout_selected,
+        "selection": {"train": train_selection, "heldout": heldout_selection},
         "train_prompts": digest(train_rows),
         "heldout_prompts": digest(heldout_rows),
         "wrapper": wrapper,
         "wrapper_hash": digest(wrapper),
+        "prompt_max_tokens": config["prompt"].get("max_tokens"),
         "tokenizer_class": type(tokenizer).__name__,
         "chat_template_hash": digest(tokenizer.chat_template),
         "sampling": config["sampling"],
@@ -266,6 +333,39 @@ def last_boxed_answer(response):
     return None
 
 
+def normalize_boxed_color(boxed):
+    r"""Unwrap a named-color command covering one complete boxed answer.
+
+    This only removes the styling of \color{name}{content} or
+    \textcolor{name}{content}. Balanced content is retained exactly; unsupported
+    color syntax, malformed groups and trailing expressions are left unchanged.
+    """
+    prefix = r"\boxed{"
+    if not boxed.startswith(prefix) or not boxed.endswith("}"):
+        return boxed
+    body = boxed[len(prefix) : -1]
+    opening = re.match(r"\s*\\(?:textcolor|color)\s*\{[A-Za-z][A-Za-z0-9_-]*\}\s*\{", body)
+    if opening is None:
+        return boxed
+    begin = opening.end() - 1
+    depth, escaped = 0, False
+    for index in range(begin, len(body)):
+        character = body[index]
+        if escaped:
+            escaped = False
+        elif character == "\\":
+            escaped = True
+        elif character == "{":
+            depth += 1
+        elif character == "}":
+            depth -= 1
+            if depth == 0:
+                if body[index + 1 :].strip():
+                    return boxed
+                return prefix + body[begin + 1 : index] + "}"
+    return boxed
+
+
 class MathVerifier:
     """Explicit symbolic backend with separate prediction/gold parse failures."""
 
@@ -293,7 +393,7 @@ class MathVerifier:
         timeout = self.config["timeout_seconds"]
         try:
             gold = parse(
-                "\\boxed{" + str(answer) + "}",
+                normalize_boxed_color("\\boxed{" + str(answer) + "}"),
                 extraction_config=[LatexExtractionConfig()],
                 fallback_mode="no_fallback",
                 parsing_timeout=timeout,
@@ -308,6 +408,7 @@ class MathVerifier:
                         "parse_status": "prediction_parse_failure",
                         "reason": "missing or malformed final boxed answer",
                     }
+                response = normalize_boxed_color(response)
             prediction = parse(
                 response,
                 extraction_config=(

@@ -15,7 +15,7 @@ import shutil
 import subprocess
 from pathlib import Path
 
-from .config import ConfigurationError, feature_geometry, validate_config
+from .config import SUPPORTED_MODELS, ConfigurationError, feature_geometry, validate_config
 from .storage import CacheConflict, atomic_json, digest, file_hash, read_json
 
 LOG = logging.getLogger(__name__)
@@ -38,15 +38,21 @@ def _model_dimensions(model_config):
 
 
 def estimate_parameter_count(model_config):
-    """Qwen3 dense transformer count, including q/k norms and optional biases."""
+    """Dense Qwen2/Qwen3 count with the architecture's norms and attention biases."""
     dims = _model_dimensions(model_config)
     d, v, mlp, layers = (dims[key] for key in ("hidden_size", "vocab_size", "intermediate_size", "num_hidden_layers"))
     qwidth = dims["num_attention_heads"] * dims["head_dim"]
     kvwidth = dims["num_key_value_heads"] * dims["head_dim"]
     attention = 2 * d * qwidth + 2 * d * kvwidth
     feedforward = 3 * d * mlp
-    normalization = 2 * d + 2 * dims["head_dim"]
-    biases = (qwidth + 2 * kvwidth + d) if model_config.get("attention_bias", False) else 0
+    normalization = 2 * d
+    if model_config.get("model_type", "qwen3") == "qwen2":
+        # Qwen2 has biased Q/K/V projections, an unbiased output projection and
+        # no per-head Q/K RMSNorm. These biases are part of the architecture.
+        biases = qwidth + 2 * kvwidth
+    else:
+        normalization += 2 * dims["head_dim"]
+        biases = (qwidth + 2 * kvwidth + d) if model_config.get("attention_bias", False) else 0
     if model_config.get("mlp_bias", False):
         biases += 2 * mlp + d
     embeddings = v * d * (1 if model_config.get("tie_word_embeddings", False) else 2)
@@ -91,6 +97,7 @@ def detect_hardware(output_dir):
         devices = selected
     if not devices:
         raise ConfigurationError("GPU_PREFLIGHT_UNAVAILABLE: no visible GPU")
+    _require_distinct_devices(devices)
     meminfo = {}
     for line in Path("/proc/meminfo").read_text().splitlines():
         name, value = line.split(":", 1)
@@ -102,6 +109,11 @@ def detect_hardware(output_dir):
         "disk_free_bytes": shutil.disk_usage(output_dir).free,
         "cuda_visible_devices": visible,
     }
+
+
+def _require_distinct_devices(devices):
+    if any(len({device[field] for device in devices}) != len(devices) for field in ("index", "uuid")):
+        raise ConfigurationError("Generation requires distinct visible GPUs; duplicate GPU index or UUID detected")
 
 
 def estimate_resources(config, model_config, hardware):
@@ -138,7 +150,15 @@ def estimate_resources(config, model_config, hardware):
     # plus a four-byte per-token metadata allowance.
     factor_bytes_per_token = d * 4 + 20
     factor_tokens = total_draws * new_tokens
-    factor_cache = factor_tokens * factor_bytes_per_token
+    factor_retention = features.get("factor_cache_retention", "all")
+    if factor_retention not in {"all", "group"}:
+        raise ConfigurationError("features.factor_cache_retention must be all or group")
+    if factor_retention == "group" and not delta_proxy:
+        raise ConfigurationError("features.factor_cache_retention=group requires features.backend=delta_proxy")
+    # Group retention releases held-out factors after each response and training
+    # factors after each complete group. All draws still count toward token work.
+    peak_factor_tokens = (draws if factor_retention == "group" else total_draws) * new_tokens
+    factor_cache = peak_factor_tokens * factor_bytes_per_token
     qwidth = dims["num_attention_heads"] * dims["head_dim"]
     kvwidth = dims["num_key_value_heads"] * dims["head_dim"]
     kv_single_context = 2 * dims["num_hidden_layers"] * context * kvwidth * dtype_bytes
@@ -169,8 +189,45 @@ def estimate_resources(config, model_config, hardware):
     disk_required = factor_cache + 2 * output_head + 2 * rollout_cache + training_gram_cache + 2 * weights
     devices = hardware.get("gpu_devices", [])
     tp = config["generation"]["tensor_parallel_size"]
-    if not isinstance(tp, int) or tp <= 0 or len(devices) < tp:
-        raise ConfigurationError(f"tensor_parallel_size={tp} requires that many visible GPUs; detected={len(devices)}")
+    parallel_splits = config["generation"].get("parallel_splits", False)
+    if type(parallel_splits) is not bool:
+        raise ConfigurationError("generation.parallel_splits must be a boolean")
+    if type(tp) is not int or tp <= 0:
+        raise ConfigurationError("generation.tensor_parallel_size must be a positive integer")
+    replicas = config["generation"].get("replicas_per_split", 1)
+    if type(replicas) is not int or replicas <= 0:
+        raise ConfigurationError("generation.replicas_per_split must be a positive integer")
+    if not parallel_splits and replicas != 1:
+        raise ConfigurationError("generation.replicas_per_split > 1 requires generation.parallel_splits=true")
+    engine_count = 2 * replicas if parallel_splits else 1
+    required_gpus = engine_count * tp
+    if len(devices) < required_gpus:
+        raise ConfigurationError(
+            f"generation.parallel_splits={parallel_splits}, replicas_per_split={replicas} "
+            f"with tensor_parallel_size={tp} requires "
+            f"{required_gpus} distinct visible GPUs; detected={len(devices)}"
+        )
+    assigned_devices = devices[:required_gpus]
+    _require_distinct_devices(assigned_devices)
+    device_groups = {}
+    for split_index, split in enumerate(("train", "heldout")):
+        for shard_index in range(replicas):
+            key = split if replicas == 1 else f"{split}:{shard_index}"
+            start = (split_index * replicas + shard_index) * tp if parallel_splits else 0
+            device_groups[key] = [
+                {"index": device["index"], "uuid": device["uuid"]} for device in assigned_devices[start : start + tp]
+            ]
+    if dims["num_attention_heads"] % tp:
+        raise ConfigurationError(
+            f"tensor_parallel_size={tp} must divide model num_attention_heads={dims['num_attention_heads']}"
+        )
+    kv_heads = dims["num_key_value_heads"]
+    # vLLM shards KV heads below their count and replicates them above it.
+    if max(tp, kv_heads) % min(tp, kv_heads):
+        raise ConfigurationError(
+            f"tensor_parallel_size={tp} and model num_key_value_heads={kv_heads} "
+            "must divide one another for KV-head sharding or replication"
+        )
     utilization = config["generation"]["gpu_memory_utilization"]
     safety = config["memory"].get("safety_fraction", 0.8)
     if not 0 < utilization < 1 or not 0 < safety <= 1:
@@ -183,10 +240,14 @@ def estimate_resources(config, model_config, hardware):
             raise ConfigurationError(f"memory.{name} must be positive")
         return min(observed, override * GIB) if override is not None else observed
 
-    gpu_free = [budget("gpu_budget_gib", device["free_bytes"]) for device in devices[:tp]]
+    gpu_free = [budget("gpu_budget_gib", device["free_bytes"]) for device in assigned_devices]
     cpu_available = budget("cpu_budget_gib", hardware["cpu_available_bytes"])
     disk_available = budget("disk_budget_gib", hardware["disk_free_bytes"])
-    generation_allocations = [utilization * device["total_bytes"] for device in devices[:tp]]
+    generation_allocations = [utilization * device["total_bytes"] for device in assigned_devices]
+    # Reserve a full checkpoint copy plus host overhead for each concurrent
+    # engine. Feature extraction runs only after generation workers have exited.
+    generation_cpu_peak = engine_count * (weights + GIB)
+    cpu_peak = max(cpu_feature_peak, generation_cpu_peak)
     # At least one maximum-context request must fit. vLLM schedules additional
     # requests within its allocated KV pool; request_chunk_size is not residency.
     generation_minimum = weights / tp + kv_single_context / tp + runtime_reserve
@@ -195,6 +256,8 @@ def estimate_resources(config, model_config, hardware):
         violations.append("configured feature peak exceeds first visible GPU's safe available budget")
     if cpu_feature_peak > safety * cpu_available:
         violations.append("configured atom/Gram feature peak exceeds safe CPU RAM budget")
+    if generation_cpu_peak > safety * cpu_available:
+        violations.append("concurrent generation model copies exceed safe CPU RAM budget")
     if disk_required > safety * disk_available:
         violations.append("conservative factor/rollout cache estimate exceeds safe artifact-disk budget")
     for index, (allocation, available) in enumerate(zip(generation_allocations, gpu_free, strict=True)):
@@ -218,6 +281,8 @@ def estimate_resources(config, model_config, hardware):
         "feature_gram_gpu_peak": feature_gram_peak,
         "feature_gpu_peak": feature_gpu_peak,
         "feature_cpu_peak": cpu_feature_peak,
+        "generation_cpu_peak": generation_cpu_peak,
+        "cpu_peak": cpu_peak,
         "disk_required": disk_required,
         "generation_minimum_per_gpu": generation_minimum,
     }
@@ -229,6 +294,11 @@ def estimate_resources(config, model_config, hardware):
         "vocab_size": v,
         "hidden_size": d,
         "parameter_estimate": parameters,
+        "generation_parallel_splits": parallel_splits,
+        "generation_replicas_per_split": replicas,
+        "generation_engine_count": engine_count,
+        "generation_required_gpus": required_gpus,
+        "generation_device_groups": device_groups,
         "max_group_atoms": max_atoms,
         "max_segments_per_response_budget": segment_budget,
         "logit_vocab_chunk_size": logit_vocab_chunk,
@@ -238,6 +308,8 @@ def estimate_resources(config, model_config, hardware):
         "training_token_upper_bound": training_draws * new_tokens,
         "heldout_token_upper_bound": heldout_draws * new_tokens,
         "total_token_upper_bound": factor_tokens,
+        "peak_factor_token_upper_bound": peak_factor_tokens,
+        "factor_cache_retention": factor_retention,
         "factor_bytes_per_token": factor_bytes_per_token,
         "bytes": byte_estimates,
         "gib": {key: value / GIB for key, value in byte_estimates.items()},
@@ -254,9 +326,16 @@ def estimate_resources(config, model_config, hardware):
         "fits": not violations,
         "assumptions": [
             "Every draw reaches max_new_tokens; held-out zero-reward factors may be omitted only after verification.",
+            (
+                "Factor storage peaks at one training group; held-out factors are streamed one response at a time. "
+                "Temporary factors are released after aggregation and are not retained for all draws."
+                if factor_retention == "group"
+                else "Per-response factors are retained for all training and held-out draws."
+            ),
             "Failed-response segments are never capped; actual atom counts require a repeated preflight check.",
             "Feature model occupies the first visible GPU in full, irrespective of generation tensor parallelism.",
             "Generation and feature models are loaded in separate processes and do not coexist.",
+            "Generation CPU sizing reserves one full model copy plus one GiB per concurrent engine.",
             "SDPA inference avoids an explicit context-squared attention matrix; no eager attention fallback.",
             "Two GiB GPU runtime reserve plus memory.safety_fraction cover allocator/workspace uncertainty.",
             "Disk figures reserve uncompressed text/JSON allowances; actual cache growth must be monitored.",
@@ -294,6 +373,7 @@ def _lock_model(config, output_dir):
             raise CacheConflict(
                 "LOCAL_MODEL_CHANGED: files differ from locked content snapshot; use a new output directory"
             )
+        _validate_model_metadata(model, locked["model_config"])
         return locked
     local_path = request["local_path"]
     additional = {}
@@ -325,10 +405,7 @@ def _lock_model(config, output_dir):
         config_path = hf_hub_download(repo_id=model["id"], filename="config.json", revision=revision)
         model_config = read_json(config_path)
         additional = {"model_config_sha256": file_hash(config_path)}
-    if model_config.get("model_type") != "qwen3":
-        raise ConfigurationError("Locked checkpoint config must declare model_type=qwen3")
-    if model_config.get("max_position_embeddings", 0) < model["max_model_len"]:
-        raise ConfigurationError("Model config cannot support the declared 32768 context")
+    _validate_model_metadata(model, model_config)
     dims = _model_dimensions(model_config)
     locked = (
         request
@@ -346,8 +423,20 @@ def _lock_model(config, output_dir):
     return locked
 
 
+def _validate_model_metadata(model, model_config):
+    expected_type = SUPPORTED_MODELS[model["id"]]
+    if model_config.get("model_type") != expected_type:
+        raise ConfigurationError(f"Locked checkpoint {model['id']} config must declare model_type={expected_type}")
+    native_context = model_config.get("max_position_embeddings")
+    if type(native_context) is not int or native_context < model["max_model_len"]:
+        raise ConfigurationError(
+            f"Model config cannot support the declared {model['max_model_len']} context "
+            f"(max_position_embeddings={native_context})"
+        )
+
+
 def run_preflight(config, output_dir, *, hardware=None, enable_round2=False):
-    """Validate first, pin metadata, estimate exact geometry, write reviewable results."""
+    """Validate, pin metadata, estimate selected geometry, write reviewable results."""
     validate_config(config, enable_round2=enable_round2)
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -358,16 +447,17 @@ def run_preflight(config, output_dir, *, hardware=None, enable_round2=False):
     report_path = output_dir / "preflight.json"
     atomic_json(report_path, report)
     LOG.info(
-        "Exact-head preflight model_lock=%s report=%s estimates=%s",
+        "Feature preflight backend=%s model_lock=%s report=%s estimates=%s",
+        estimates["backend"],
         output_dir / "model_lock.json",
         report_path,
         estimates,
     )
     if not estimates["fits"]:
         raise ConfigurationError(
-            "EXACT_HEAD_RESOURCE_BUDGET_EXCEEDED: "
+            "FEATURE_RESOURCE_BUDGET_EXCEEDED: "
             + "; ".join(estimates["violations"])
             + f". Review {report_path}; generation has not started. "
-            + "No proxy, token cap, or segment cap was substituted."
+            + "Configured feature geometry, token cap, and segment policy were preserved."
         )
     return [output_dir / "model_lock.json", report_path]

@@ -1,4 +1,4 @@
-# Frozen-checkpoint Diagnostic B. Author-selected settings; response/context conflict must be resolved.
+# Frozen-checkpoint Diagnostic B. Fixed response cap leaves room for the prompt.
 round_id: round2
 enabled: false
 seed: 42
@@ -16,6 +16,7 @@ train:
   local_path: null
   config: default
   split: train
+  data_files: [data/train-00000.parquet]  # Pinned shard; dataset-card row count is stale.
   n_problem: 128
 heldout:
   id: RUC-AIBOX/OlymMATH
@@ -26,7 +27,7 @@ heldout:
 prompt:
   wrapper_file: boxed_prompt.json  # Applied to train and held-out user messages.
 sampling:
-  max_new_tokens: 32768  # Requested response cap; prompt also needs context space.
+  max_new_tokens: 30720  # Reserve 2048 tokens for the prompt within the 32768-token context.
   temperature: 1.0
   top_p: 1.0
   top_k: -1
@@ -44,7 +45,8 @@ verifier:
 routing:
   radius_coefficient: 0.4
   epsilon: 0.000001  # Same stabilizer as veRL core_algos.py; std uses divisor G.
-  solver: {}
+  solver:
+    max_iterations: 500  # Maximum per solve attempt; converged solves stop earlier.
 features:
   backend: delta_proxy  # Author-requested DelTA Appendix F: (1 - p_y) * hidden.
   token_chunk_size: 128

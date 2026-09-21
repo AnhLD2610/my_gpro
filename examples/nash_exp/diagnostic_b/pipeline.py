@@ -14,7 +14,9 @@ import inspect
 import logging
 import math
 import os
+import tempfile
 import time
+from contextlib import contextmanager
 from pathlib import Path
 
 import numpy as np
@@ -63,6 +65,8 @@ def prompt_code_hash():
             "check_overlap",
             "local_snapshot",
             "load_dataset_snapshot",
+            "last_boxed_answer",
+            "select_row_indices",
             "prepare_manifests",
         )
     }
@@ -187,6 +191,21 @@ def extract_response(extractor, row, root, feature_identity):
     return path
 
 
+@contextmanager
+def factor_workspace(config, root):
+    """Own only disposable factors; final aggregates always live in the run root."""
+    retention = config["features"].get("factor_cache_retention", "all")
+    if retention == "all":
+        yield root
+        return
+    if retention != "group" or config["features"]["backend"] != "delta_proxy":
+        raise ValueError("factor_cache_retention='group' requires the delta_proxy backend")
+    scratch = root / "features" / "factor_scratch"
+    scratch.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix="working-", dir=scratch) as directory:
+        yield Path(directory)
+
+
 def compute_heldout_features(config, root):
     """One method-independent h_Q, summing scores and dividing by ALL M*K draws."""
     from .features import HeadAtom
@@ -209,14 +228,32 @@ def compute_heldout_features(config, root):
         "feature_config": config["features"],
         "libraries": package_versions("torch", "transformers", "numpy"),
     }
-    for row in read_compressed_records(root / "heldout_rollouts.jsonl.zst"):
-        token_count += len(row["response_token_ids"])
-        if verification[rollout_key(row)]["reward"]:
-            path = extract_response(extractor, row, root, identity)
-            atoms.append(HeadAtom(path))  # No per-response length normalization.
     target = root / "features" / "heldout_head.npy"
     target.parent.mkdir(parents=True, exist_ok=True)
-    extractor.build_heldout_head(atoms, np.ones(len(atoms)), counts["draws"], target)
+    if config["features"].get("factor_cache_retention", "all") == "group":
+
+        def successful_atoms():
+            nonlocal token_count
+            for row in read_compressed_records(root / "heldout_rollouts.jsonl.zst"):
+                token_count += len(row["response_token_ids"])
+                if verification[rollout_key(row)]["reward"]:
+                    with factor_workspace(config, root) as factor_root:
+                        try:
+                            path = extract_response(extractor, row, factor_root, identity)
+                            yield HeadAtom(path)  # No per-response length normalization.
+                        finally:
+                            extractor.clear_factor_cache()
+
+        extractor.build_heldout_head_stream(
+            successful_atoms(), counts["draws"], target, expected_successes=counts["successes"]
+        )
+    else:
+        for row in read_compressed_records(root / "heldout_rollouts.jsonl.zst"):
+            token_count += len(row["response_token_ids"])
+            if verification[rollout_key(row)]["reward"]:
+                path = extract_response(extractor, row, root, identity)
+                atoms.append(HeadAtom(path))
+        extractor.build_heldout_head(atoms, np.ones(len(atoms)), counts["draws"], target)
     manifest = {
         "geometry": feature_geometry(config),
         "head_shape": list(extractor.head_shape),
@@ -383,36 +420,40 @@ def compute_training_features_and_routes(config, root):
                     trust_remote_code=False,
                 )
             max_atoms = config["n_rollout"] * config["features"]["max_segments_per_response_budget"]
-            atoms, positive_info, negative_info = make_group_atoms(
-                rows, rewards, extractor, tokenizer, root, feature_identity, max_atoms
-            )
-            if len(atoms) > max_atoms:
-                raise RuntimeError(
-                    f"ACTUAL_ATOMS_EXCEED_PREFLIGHT: group={index} atoms={len(atoms)} budget={max_atoms}. "
-                    "Increase the declared memory/segment estimate after reviewing preflight; no segments dropped."
-                )
-            result = extractor.build_gram(atoms, heldout)
-            gram, cross = result["gram"], result["heldout_cross"]
-            LOG.info(
-                "Group %s Gram geometry=%s atoms=%s min_eigenvalue=%g",
-                index,
-                feature_geometry(config),
-                len(atoms),
-                result["min_eigenvalue"],
-            )
-            temporary = cache_path.with_suffix(".tmp")
-            with temporary.open("wb") as handle:
-                np.savez(handle, gram=gram, heldout_cross=cross)
-            os.replace(temporary, cache_path)
-            metadata = {
-                "identity": identity,
-                "sha256": file_hash(cache_path),
-                "positive_info": positive_info,
-                "negative_info": negative_info,
-                "min_eigenvalue": result["min_eigenvalue"],
-            }
-            atomic_json(metadata_path, metadata)
-            extractor.clear_factor_cache()
+            with factor_workspace(config, root) as factor_root:
+                try:
+                    atoms, positive_info, negative_info = make_group_atoms(
+                        rows, rewards, extractor, tokenizer, factor_root, feature_identity, max_atoms
+                    )
+                    if len(atoms) > max_atoms:
+                        raise RuntimeError(
+                            f"ACTUAL_ATOMS_EXCEED_PREFLIGHT: group={index} atoms={len(atoms)} budget={max_atoms}. "
+                            "Increase the declared memory/segment estimate after reviewing preflight; "
+                            "no segments dropped."
+                        )
+                    result = extractor.build_gram(atoms, heldout)
+                    gram, cross = result["gram"], result["heldout_cross"]
+                    LOG.info(
+                        "Group %s Gram geometry=%s atoms=%s min_eigenvalue=%g",
+                        index,
+                        feature_geometry(config),
+                        len(atoms),
+                        result["min_eigenvalue"],
+                    )
+                    temporary = cache_path.with_suffix(".tmp")
+                    with temporary.open("wb") as handle:
+                        np.savez(handle, gram=gram, heldout_cross=cross)
+                    os.replace(temporary, cache_path)
+                    metadata = {
+                        "identity": identity,
+                        "sha256": file_hash(cache_path),
+                        "positive_info": positive_info,
+                        "negative_info": negative_info,
+                        "min_eigenvalue": result["min_eigenvalue"],
+                    }
+                    atomic_json(metadata_path, metadata)
+                finally:
+                    extractor.clear_factor_cache()
         feature_files.append(
             {"prompt_index": index, "path": str(cache_path.relative_to(root)), "sha256": file_hash(cache_path)}
         )
@@ -635,6 +676,7 @@ def run_stage(name, config, output_dir, *, resume=False, force_stage=None, enabl
             "model_lock": lock,
             "seed": config["seed"],
             "prompt": file_hash(config["prompt"]["wrapper_file"]),
+            "prompt_max_tokens": config["prompt"].get("max_tokens"),
             "sampling": config["sampling"],
             "code": prompt_code_hash(),
             "libraries": package_versions("datasets", "transformers"),
@@ -647,10 +689,15 @@ def run_stage(name, config, output_dir, *, resume=False, force_stage=None, enabl
             "prepare": runner.dependencies(["prepare"]),
             "model_lock": lock,
             "sampling": config["sampling"],
-            "generation": config["generation"],
+            # Split scheduling changes resource use, not the sampled request contract.
+            "generation": {
+                key: value
+                for key, value in config["generation"].items()
+                if key not in ("parallel_splits", "replicas_per_split")
+            },
             "seed": config["seed"],
             "n_rollout": config["n_rollout"],
-            "code": code_hash("generation"),
+            "code": code_hash("generation", "parallel_generation"),
             "libraries": package_versions("vllm", "transformers", "torch"),
         }
         return runner.run(name, inputs, lambda: generate_shared(config, root, lock), immutable=True)

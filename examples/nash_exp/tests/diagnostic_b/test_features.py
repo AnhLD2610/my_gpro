@@ -105,14 +105,14 @@ def _toy_extractor(tmp_path, temperature=1.0, extractor_class=FeatureExtractor):
     extractor._torch = torch
     hidden = np.array([[0.2, 0.7], [-0.3, 1.1], [0.4, -0.2]], dtype=np.float32)
     token_ids = np.array([1, 3, 0])  # The final original ID could be an EOS action.
-    log_z = extractor._log_normalizers(hidden)
+    with torch.no_grad():
+        log_z, token_log_probs = extractor._normalization_factors(hidden, token_ids)
     factor_dir = tmp_path / "factors"
     factor_dir.mkdir()
     np.save(factor_dir / "hidden.npy", hidden)
     np.save(factor_dir / "token_ids.npy", token_ids)
     np.save(factor_dir / "log_normalizers.npy", log_z)
-    with torch.no_grad():
-        np.save(factor_dir / "token_log_probs.npy", extractor._selected_log_probs(hidden, token_ids, log_z))
+    np.save(factor_dir / "token_log_probs.npy", token_log_probs)
     (factor_dir / "metadata.json").write_text(
         json.dumps(
             extractor._identity()
@@ -222,15 +222,19 @@ def test_factor_cache_limits_open_maps_and_rejects_corrupted_content(tmp_path):
 
 
 def test_normalization_and_single_aggregate_tiles_are_independent_of_gram_tiles(tmp_path, monkeypatch):
-    extractor, factor_dir, hidden, weight, _ = _toy_extractor(tmp_path)
+    extractor, factor_dir, hidden, weight, token_ids = _toy_extractor(tmp_path)
     extractor.vocab_chunk_size = 1
     # Changing a numerical tile setting invalidates factor reuse: reflect this
     # newly declared toy setting in its freshly prepared factor metadata.
     metadata = json.loads((factor_dir / "metadata.json").read_text())
     metadata.update(extractor._identity())
     (factor_dir / "metadata.json").write_text(json.dumps(metadata))
-    expected = np.log(np.exp(hidden @ weight.T).sum(axis=1))
-    np.testing.assert_allclose(extractor._log_normalizers(hidden), expected, atol=2e-7)
+    logits = hidden @ weight.T
+    expected = np.logaddexp.reduce(logits, axis=1)
+    normalizers, token_log_probs = extractor._normalization_factors(hidden, token_ids)
+    np.testing.assert_allclose(normalizers, expected, atol=2e-7)
+    np.testing.assert_allclose(token_log_probs, logits[np.arange(len(token_ids)), token_ids] - expected, atol=2e-7)
+    assert np.all(token_log_probs <= 0)
     blocks = []
     original = extractor.aggregate_row_block
 

@@ -1,0 +1,5 @@
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 \
+NASH_TENSOR_PARALLEL_SIZE=1 \
+NASH_PARALLEL_SPLITS=1 \
+NASH_REPLICAS_PER_SPLIT=4 \
+bash examples/nash_exp/scripts/run_diagnostic_b_round1_gpu.sh

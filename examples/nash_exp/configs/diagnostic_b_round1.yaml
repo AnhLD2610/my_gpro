@@ -1,39 +1,53 @@
-# Frozen-checkpoint Diagnostic B. Author-selected settings; response/context conflict must be resolved.
+# Frozen-checkpoint Diagnostic B. Fixed response cap leaves room for the prompt.
 round_id: round1
 enabled: true
 seed: 42
 n_rollout: 32
 model:
-  id: Qwen/Qwen3-1.7B-Base
-  revision: main  # Resolve once to a commit SHA and lock before generation.
+  id: Qwen/Qwen2.5-Math-7B
+  revision: b101308fe89651ea5ce025f25317fea6fc07e96e
   tokenizer_revision: null  # Same immutable commit as the model.
   local_path: null
   dtype: bfloat16
-  max_model_len: 32768
+  max_model_len: 4096
 train:
-  id: sungyub/dapo-math-17k-verl
-  revision: 3cf5c112137795c1f1d5fdae7c747871b26840a4  # Pinned dataset snapshot.
+  id: ShuoZheLi/MATH-train-MATH500-test
+  revision: 09ad2162c6f3a07ea71e48d7af02922b093df041  # Same pinned snapshot for both splits.
   local_path: null
   config: default
   split: train
-  n_problem: 64
+  adapter: math
+  expected_rows: 7500
+  selection: sample  # Uniform sample without replacement, using the master seed.
+  n_problem: 500
 heldout:
-  id: MathArena/hmmt_feb_2025
-  revision: main  # Resolved once to a commit SHA before sampling.
-  config: null
+  id: ShuoZheLi/MATH-train-MATH500-test
+  revision: 09ad2162c6f3a07ea71e48d7af02922b093df041
+  config: default
   split: test
-  n_problem: 30
+  adapter: math
+  expected_rows: 500
+  selection: all  # Complete MATH500 test split, in source row order.
+  n_problem: 500
 prompt:
   wrapper_file: boxed_prompt.json  # Applied to train and held-out user messages.
+  max_tokens: 1024  # Includes the wrapper and chat template; overlong prompts are rejected.
 sampling:
-  max_new_tokens: 32768  # Requested response cap; prompt also needs context space.
+  max_new_tokens: 3072  # Prompt and response caps sum to the native 4096-token context.
   temperature: 1.0
   top_p: 1.0
   top_k: -1
   min_p: 0.0
 generation:
-  tensor_parallel_size: 1
-  request_chunk_size: 32
+  tensor_parallel_size: 1  # One 7B model per 96-GB GPU; avoids TP collectives over PCIe.
+  parallel_splits: true
+  replicas_per_split: 4  # Eight independent engines: four train, four held-out.
+  dispatch_mode: continuous  # Refill slots as answers finish, with per-answer checkpointing.
+  max_in_flight: 256  # Bounded outstanding requests per engine, across multiple prompts.
+  max_num_seqs: 256
+  max_num_batched_tokens: 16384
+  enable_chunked_prefill: true
+  request_chunk_size: 32  # Used only by the optional legacy batch dispatch mode.
   gpu_memory_utilization: 0.8
   enable_prefix_caching: true
 verifier:
@@ -44,9 +58,11 @@ verifier:
 routing:
   radius_coefficient: 0.4
   epsilon: 0.000001  # Same stabilizer as veRL core_algos.py; std uses divisor G.
-  solver: {}
+  solver:
+    max_iterations: 500  # Maximum per solve attempt; converged solves stop earlier.
 features:
   backend: delta_proxy  # Author-requested DelTA Appendix F: (1 - p_y) * hidden.
+  factor_cache_retention: group  # Release temporary factors after each group; retain Grams and held-out vector.
   token_chunk_size: 128
   vocab_chunk_size: 128  # Used only by the optional exact_tiled_head backend.
   logit_vocab_chunk_size: 8192  # Full-vocabulary normalizers for sampled-token probabilities.

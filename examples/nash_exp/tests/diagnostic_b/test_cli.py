@@ -93,8 +93,6 @@ def _approved_synthetic_config(tmp_path):
     config["routing"]["radius_coefficient"] = 0.2
     config["seed"] = 42
     config["verifier"]["backend"] = "math_verify"
-    config["train"]["id"] = "synthetic/DAPO-no-dataset-loaded"
-    config["train"]["revision"] = "a" * 40
     path = tmp_path / "approved_round1.yaml"
     path.write_text(yaml.safe_dump(config))
     return path
@@ -185,8 +183,10 @@ def test_dry_run_validates_complete_locked_config_without_loading_anything(tmp_p
     text = (output / "diagnostic_b_round1.log").read_text()
     assert "DRY_RUN_VALID" in text
     resolved = yaml.safe_load((output / "config_resolved.yaml").read_text())
-    assert resolved["train"]["n_problem"] == 64
-    assert resolved["heldout"]["n_problem"] == 30
+    assert resolved["train"]["n_problem"] == 500
+    assert resolved["train"]["selection"] == "sample"
+    assert resolved["heldout"]["n_problem"] == 500
+    assert resolved["heldout"]["selection"] == "all"
     assert resolved["n_rollout"] == 32
     assert not (output / "stage_state.json").exists()
     assert not (output / "train_rollouts.jsonl.zst").exists()

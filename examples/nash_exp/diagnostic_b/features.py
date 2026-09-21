@@ -283,7 +283,7 @@ class FeatureExtractor:
             "temperature": self.temperature,
             "geometry": self.geometry,
             "factor_dtype": "float32",
-            "feature_schema_version": 2,
+            "feature_schema_version": 3,
             "token_chunk_size": self.token_chunk_size,
             "vocab_chunk_size": self.vocab_chunk_size,
             "logit_vocab_chunk_size": self.logit_vocab_chunk_size,
@@ -357,10 +357,11 @@ class FeatureExtractor:
             del outputs, input_ids
             if hidden.shape != (len(response_ids), hidden_size):
                 raise RuntimeError("prediction-hidden alignment did not preserve sampled token count")
-            log_z = self._log_normalizers(hidden)
-            token_log_probs = self._selected_log_probs(hidden, response_ids, log_z)
+            log_z, token_log_probs = self._normalization_factors(hidden, response_ids)
         if not np.isfinite(hidden).all() or not np.isfinite(log_z).all() or not np.isfinite(token_log_probs).all():
             raise ValueError("nonfinite extracted feature factors")
+        if np.any(token_log_probs > 0):
+            raise ValueError("positive sampled-token log probability in extracted feature factors")
         factor_dir.parent.mkdir(parents=True, exist_ok=True)
         temporary = Path(tempfile.mkdtemp(prefix=f".{factor_dir.name}.", dir=factor_dir.parent))
         try:
@@ -386,33 +387,36 @@ class FeatureExtractor:
         )
         return factor_dir
 
-    def _log_normalizers(self, hidden):
+    def _normalization_factors(self, hidden, response_ids):
+        """Compute selected scores and normalizers from the same FP32 logit tiles.
+
+        A separate dot-product reduction can round a selected logit above the
+        log-sum-exp computed by GEMM, giving p > 1 for nearly certain tokens.
+        Gathering from those same tiles preserves log(p) <= 0 without clipping.
+        """
         torch = self._torch
         weight = self.model.get_output_embeddings().weight
         vocabulary_size = weight.shape[0]
-        result = np.empty(len(hidden), dtype=np.float32)
-        for start in range(0, len(hidden), self.token_chunk_size):
-            stop = min(start + self.token_chunk_size, len(hidden))
-            h = torch.tensor(hidden[start:stop], dtype=torch.float32, device=self.device)
-            log_z = torch.full((len(h),), -torch.inf, dtype=torch.float32, device=self.device)
-            for row in range(0, vocabulary_size, self.logit_vocab_chunk_size):
-                logits = h @ weight[row : row + self.logit_vocab_chunk_size].float().T / self.temperature
-                log_z = torch.logaddexp(log_z, torch.logsumexp(logits, dim=1))
-            result[start:stop] = log_z.cpu().numpy()
-        return result
-
-    def _selected_log_probs(self, hidden, response_ids, log_z):
-        """FP32 scores for comparison to cached generation-engine logprobs."""
-        torch = self._torch
-        weight = self.model.get_output_embeddings().weight
-        result = np.empty(len(hidden), dtype=np.float32)
+        response_ids = np.asarray(response_ids)
+        if response_ids.shape != (len(hidden),) or np.any(response_ids < 0) or np.any(response_ids >= vocabulary_size):
+            raise ValueError("one valid vocabulary token ID is required per hidden state")
+        normalizers = np.empty(len(hidden), dtype=np.float32)
+        token_log_probs = np.empty(len(hidden), dtype=np.float32)
         for start in range(0, len(hidden), self.token_chunk_size):
             stop = min(start + self.token_chunk_size, len(hidden))
             h = torch.tensor(hidden[start:stop], dtype=torch.float32, device=self.device)
             ids = torch.tensor(response_ids[start:stop], dtype=torch.long, device=self.device)
-            selected = (h * weight[ids].float()).sum(dim=-1) / self.temperature
-            result[start:stop] = selected.cpu().numpy() - log_z[start:stop]
-        return result
+            log_z = torch.full((len(h),), -torch.inf, dtype=torch.float32, device=self.device)
+            selected = torch.full_like(log_z, -torch.inf)
+            for row in range(0, vocabulary_size, self.logit_vocab_chunk_size):
+                logits = h @ weight[row : row + self.logit_vocab_chunk_size].float().T / self.temperature
+                local_ids = (ids - row).clamp(0, logits.shape[1] - 1)
+                in_tile = (ids >= row) & (ids < row + logits.shape[1])
+                selected = torch.where(in_tile, logits.gather(1, local_ids[:, None]).squeeze(1), selected)
+                log_z = torch.logaddexp(log_z, torch.logsumexp(logits, dim=1))
+            normalizers[start:stop] = log_z.cpu().numpy()
+            token_log_probs[start:stop] = (selected - log_z).cpu().numpy()
+        return normalizers, token_log_probs
 
     def _read_factors(self, factor_path):
         key = str(Path(factor_path).resolve())
@@ -629,14 +633,45 @@ class DeltaProxyExtractor(FeatureExtractor):
             raise ValueError("held-out atoms must be token sums without response normalization")
         if not rewards.any():
             raise ValueError("INSUFFICIENT_HELDOUT_SUCCESSES")
-        aggregate = np.zeros(self.feature_shape, dtype=np.float32)
+        return self.build_heldout_head_stream(
+            (atom for atom, reward in zip(atoms, rewards, strict=True) if reward),
+            total_draws,
+            out_path,
+            expected_successes=int(rewards.sum()),
+        )
+
+    def build_heldout_head_stream(self, successful_atoms, total_draws, out_path, *, expected_successes):
+        """Consume successful responses once, allowing factors to be released between draws.
+
+        Keep the retained-cache FP32 summation order and all-draw denominator.
+        The caller owns the iterator's temporary factor workspaces; closing it
+        on error ensures those workspaces are also released.
+        """
+        atoms = iter(successful_atoms)
         try:
-            for index, (atom, reward) in enumerate(zip(atoms, rewards, strict=True)):
-                if reward:
+            if not isinstance(expected_successes, int | np.integer) or expected_successes <= 0:
+                raise ValueError("INSUFFICIENT_HELDOUT_SUCCESSES")
+            if not isinstance(total_draws, int | np.integer) or total_draws < expected_successes:
+                raise ValueError("total_draws must count all held-out samples")
+            aggregate = np.zeros(self.feature_shape, dtype=np.float32)
+            observed = 0
+            for atom in atoms:
+                observed += 1
+                if observed > expected_successes:
+                    raise ValueError("held-out success count differs from verification")
+                if atom.token_weights is not None:
+                    raise ValueError("held-out atoms must be token sums without response normalization")
+                try:
                     aggregate += self.aggregate_proxy(atom) / np.float32(total_draws)
-                LOGGER.info("Held-out DelTA proxy response %s/%s", index + 1, len(atoms))
+                finally:
+                    self.clear_factor_cache()
+                LOGGER.info("Held-out DelTA proxy response %s/%s", observed, expected_successes)
+            if observed != expected_successes:
+                raise ValueError("held-out success count differs from verification")
         finally:
             self.clear_factor_cache()
+            if hasattr(atoms, "close"):
+                atoms.close()
         if not np.isfinite(aggregate).all():
             raise ValueError("nonfinite held-out DelTA proxy estimator")
         out_path = Path(out_path)

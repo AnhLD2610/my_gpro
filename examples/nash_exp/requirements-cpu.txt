@@ -8,6 +8,7 @@ matplotlib>=3.8
 PyYAML>=6
 zstandard>=0.22
 math-verify==0.8.0
+transformers>=4.51,<5  # Tiny CPU model-config tests; no checkpoint downloads.
 pytest>=8
 ruff==0.12.2
 mypy==1.17.0
